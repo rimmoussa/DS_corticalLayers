@@ -1,0 +1,179 @@
+---
+title: "final project"
+author: "Nour Al khoury, Rim Moussa (Team 3)"
+date: "6/13/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(stringr)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(ggrepel)
+library(treemapify)
+library(tidyverse)
+```
+
+
+
+# Data
+```{r}
+metadata = read.csv("data/metadata.csv")
+#layers.extended = read.csv("layers_extended.csv")
+# hippocampal_regions = c("HIP", "PAR-POST-PRE-SUB-ProS", "ENT")
+# metadata = metadata %>%
+#   dplyr::filter(! region_label %in% hippocampal_regions)
+```
+
+# Exploratory Data Analysis
+## Number of cells per donor
+```{r}
+# as.data.frame(table(metadata$external_donor_name_label)) %>%
+#   ggplot(aes(x = reorder(Var1, -Freq), y = Freq, fill =metadata$donor_sex_label[match(Var1, metadata$external_donor_name_label)]))+
+ metadata %>%
+  ggplot(aes(x = factor(external_donor_name_label), fill=donor_sex_label)) +
+  geom_bar(stat = "count") # stat = "count" is implied in the first example 
+
+
+# g2 = metadata %>%
+#   ggplot(aes(x = donor_sex_label, fill = donor_sex_label))+
+#   geom_bar()
+
+#g1 + g2 
+```
+
+
+# Cell type distribution (hyde mesh aajbetna)
+```{r}
+parse_type <- function(x) {str_extract(x, "L[1-6](a|b)?((/|-)[1-6])?(a|b)?")}
+metadata3$layer <- sapply(metadata3$cluster_label, parse_layer)
+type_count = data.frame(table(metadata$cluster_label))
+
+type_count %>% 
+  ggplot(aes(x = Freq, y = Var1, label = Var1, fill=Var1)) +
+  geom_bar(stat = "identity") +
+  #geom_text_repel(max.overlaps = 20) +
+  theme_minimal() +
+  theme(legend.position = "None",
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank()) +  
+  labs(x = "Count",
+       y = "Variable name")
+```
+
+## Cell type distribtion per brain region
+```{r}
+df = data.frame(table(metadata$cluster_label))
+df$region_label = rep('M1',nrow(df))
+```
+
+```{r}
+ggplot(df, aes(area = Freq, fill = Var1,subgroup = region_label,
+               label = paste(Var1, Freq, sep = "\n"))) +
+  geom_treemap() +
+  geom_treemap_text(colour = "white",
+                    place = "centre",
+                    size = 25) +
+    geom_treemap_subgroup_text(place = "centre", grow = TRUE,
+                             alpha = 0.25, colour = "black",
+                             fontface = "italic") +
+  theme(legend.position = "none")
+```
+
+
+## Class distribution of cells
+```{r}
+metadata %>% 
+  ggplot(aes(x = class_label, group = class_label, fill=class_label)) + 
+  geom_bar(stat = "count") # stat = "count" is implied in the first example 
+```
+
+
+## Number of cells per layer
+Parsing cortical layer
+```{r}
+parse_layer <- function(x) {str_extract(x, "L[1-6](a|b)?((/|-)[1-6])?(a|b)?")}
+metadata$layer <- sapply(metadata$cluster_label, parse_layer)
+```
+
+
+```{r}
+metadata %>% 
+  ggplot(aes(x = layer, group = layer, fill = layer)) + 
+  geom_bar(stat = "count") # stat = "count" is implied in the first example 
+```
+
+
+```{r}
+DE_metadata = metadata %>%
+  dplyr::filter(layer %in% c("L1", "L2", "L3", "L5", "L6"),
+                ! class_label %in% "Non-Neuronal")
+```
+
+
+```{r}
+DE_metadata %>% 
+  ggplot(aes(x = layer, group = layer, fill = layer)) + 
+  geom_bar(stat = "count")
+```
+
+```{r}
+DE_metadata %>% 
+  ggplot(aes(x = class_label, group = class_label, fill=class_label)) + 
+  geom_bar(stat = "count")
+```
+
+```{r}
+write.csv(DE_metadata, file = "data/metadata-fitlered.csv")
+```
+
+
+<!-- ### Fixing distribution -->
+<!-- ```{r} -->
+<!-- #layers.extended = data.frame() -->
+
+<!-- for (row in 57725:nrow(metadata)){ -->
+<!--   layers = strsplit(metadata$layer[row], "-") -->
+<!--   start =  strtoi(str_replace(layers[[1]][1],'L', '')) -->
+
+<!--   if (length(layers[[1]]) > 1) { -->
+<!--     end = strtoi(layers[[1]][2])} -->
+<!--   else{ -->
+<!--     end = strtoi(start) -->
+<!--   } -->
+<!--   l = c() -->
+<!--   df = data.frame() -->
+<!--   for (i in start:end) { -->
+<!--     l = c(l, i) -->
+<!--     df = rbind(metadata[row,], df) -->
+<!--   } -->
+<!--   df$single_layer = l -->
+
+<!--   layers.extended = rbind(layers.extended, df) -->
+<!-- } -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- write.csv(layers.extended,"../data/layers_extended.csv", row.names = FALSE) -->
+<!-- ``` -->
+
+
+```{r}
+layers.extended %>% 
+  ggplot(aes(x = single_layer, group = factor(single_layer), fill = factor(single_layer))) + 
+  geom_bar(stat = "count") # stat = "count" is implied in the first example 
+```
+
+
+## PCA
+```{r}
+
+```
+
+
+
