@@ -1,15 +1,15 @@
 ---
-title: "final project"
+title: "Data Exploration"
 author: "Nour Al khoury, Rim Moussa (Team 3)"
 date: "6/13/2022"
 output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
 ```
 
-```{r}
+```{r echo = FALSE, message=FALSE, warning=FALSE}
 library(stringr)
 library(ggplot2)
 library(patchwork)
@@ -21,16 +21,14 @@ library(tidyverse)
 
 
 
-# Data
+# Load Data
 ```{r}
 metadata = read.csv("data/metadata.csv")
-#layers.extended = read.csv("layers_extended.csv")
-# hippocampal_regions = c("HIP", "PAR-POST-PRE-SUB-ProS", "ENT")
-# metadata = metadata %>%
-#   dplyr::filter(! region_label %in% hippocampal_regions)
+
 ```
 
 # Exploratory Data Analysis
+
 ## Number of cells per donor
 ```{r}
 # as.data.frame(table(metadata$external_donor_name_label)) %>%
@@ -48,22 +46,23 @@ metadata = read.csv("data/metadata.csv")
 ```
 
 
-# Cell type distribution (hyde mesh aajbetna)
+# Cell type distribution
 ```{r}
-parse_type <- function(x) {str_extract(x, "L[1-6](a|b)?((/|-)[1-6])?(a|b)?")}
-metadata3$layer <- sapply(metadata3$cluster_label, parse_layer)
+#parse_type <- function(x) {str_extract(x, "L[1-6](a|b)?((/|-)[1-6])?(a|b)?")}
+#metadata$layer <- sapply(metadata$cluster_label, parse_layer)
 type_count = data.frame(table(metadata$cluster_label))
 
 type_count %>% 
-  ggplot(aes(x = Freq, y = Var1, label = Var1, fill=Var1)) +
+  ggplot(aes(y = Freq, x = Var1, label = Var1, fill=Var1)) +
   geom_bar(stat = "identity") +
   #geom_text_repel(max.overlaps = 20) +
   theme_minimal() +
   theme(legend.position = "None",
         axis.ticks.y = element_blank(),
-        axis.text.y = element_blank()) +  
-  labs(x = "Count",
-       y = "Variable name")
+        axis.text.y = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +  
+  labs(y = "Count",
+       x = "Cell Type")
 ```
 
 ## Cell type distribtion per brain region
@@ -108,7 +107,9 @@ metadata %>%
   geom_bar(stat = "count") # stat = "count" is implied in the first example 
 ```
 
+# Post filtering
 
+filter out ambiguous layers and non neuronal cell types
 ```{r}
 DE_metadata = metadata %>%
   dplyr::filter(layer %in% c("L1", "L2", "L3", "L5", "L6"),
@@ -163,17 +164,87 @@ write.csv(DE_metadata, file = "data/metadata-fitlered.csv")
 <!-- ``` -->
 
 
-```{r}
+```{r eval=FALSE, include=FALSE}
 layers.extended %>% 
   ggplot(aes(x = single_layer, group = factor(single_layer), fill = factor(single_layer))) + 
   geom_bar(stat = "count") # stat = "count" is implied in the first example 
 ```
 
+```{python}
+def read_pickle_file(file):
+    pickle_data = pd.read_pickle(file)
+    return pickle_data
+```
 
-## PCA
+
 ```{r}
+data = read.csv("../../../Applied Machine Learning/Projects/week9/data2.csv")
+cols = read.csv("../../../Applied Machine Learning/Projects/week9/cols2.csv", header = FALSE)[,1]
+```
+
+
+```{r}
+colnames(data) = cols
+write.csv(data, file = "../../../Applied Machine Learning/Projects/week9/data-larger.csv")
+```
+
+
+```{r}
+metadata = read.delim("../../../Applied Machine Learning/Projects/week9/a_MTBLS1129_LC-MS_positive_reverse-phase_metabolite_profiling.txt")
+metadata2 = read.delim("../../../Applied Machine Learning/Projects/week9/m_MTBLS1129_LC-MS_positive_reverse-phase_metabolite_profiling_v2_maf.tsv")
+```
+
+```{r}
+tmp = gsub(x = colnames(data), pattern = "\\.featureXML", replacement = "")
+
+tmp2 =  gsub(x = colnames(data), pattern = "\\.mzML", replacement = "")
+colnames(data) = tmp2
+
+data2 = data %>%
+  #dplyr::relocate(relocate(c("mz", "mzmin", "mzmax"," rt", "rtmin", "rtmax" ), .after = last_col()))
+  dplyr::relocate(c(mz, mzmin, mzmax,rt, rtmin, rtmax), .after = last_col())
+
+write.csv(data, file = "../../../Applied Machine Learning/Projects/week9/data-larger.csv")
+metadata$`Include Sample` = metadata$Derived.Spectral.Data.File %in% tmp
+
+metadata$Dilution = 100
+  
+new_metadata = metadata %>%
+  dplyr::select(`Sample.Name`, `Derived.Spectral.Data.File`, `MS.Assay.Name`, Dilution,  `Include Sample`) %>%
+  dplyr::mutate(`Derived.Spectral.Data.File` = gsub("\\.mzML", replacement = "", x = `Derived.Spectral.Data.File`),
+                #`Derived.Spectral.Data.File` = gsub("mennormal", replacement = "", x = `Derived.Spectral.Data.File`)
+                `MS.Assay.Name` = "Assay",
+                SampleType = "Study Sample"
+                )%>%
+          
+                #`Correction Batch` = sample(1:2, size = 19, replace = T),
+                #`Derived.Spectral.Data.File` = paste0("data/",`Derived.Spectral.Data.File`),) 
+  dplyr::rename(`Sample ID` = `Sample.Name`,
+                `Sample File Name` = `Derived.Spectral.Data.File`,
+                `AssayRole` = `MS.Assay.Name`) %>%
+  dplyr::filter(`Include Sample`) %>%
+  dplyr::mutate(`Correction Batch` =  NA) 
+
+new_metadata$SampleType[grep(pattern = "^QC", x = new_metadata$`Sample ID`)] = "Study Pool"
+new_metadata$AssayRole[grep(pattern = "^QC", x = new_metadata$`Sample ID`)] = "Precision Reference"
+
+
+# data = data %>%
+#   dplyr::select(c(mz, mzmin, mzmax,rt, rtmin, rtmax), new_metadata$`Sample File Name`)
+#write.csv(data, file = "../../../Applied Machine Learning/Projects/week9/data-pooled.csv")
+
+data2 = data %>%
+  dplyr::select(-c( mz,mzmin  ,  mzmax   ,     rt ,    rtmin,     rtmax))
+write.csv(data2, file = "../../../Applied Machine Learning/Projects/week9/data2.csv")
+
+write.csv(new_metadata, "../../../Applied Machine Learning/Projects/week9/new_metadata-pooled.csv")
 
 ```
+
+
+
+
+
 
 
 

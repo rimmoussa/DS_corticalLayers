@@ -1,0 +1,731 @@
+---
+title: "SCENIC pipeline"
+author: "Rim Moussa, Nour Alkhoury"
+date: '2022-06-15'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(Seurat)
+library(data.table)
+library(tidyverse)
+library(colorspace)
+library(ComplexHeatmap)
+library(topGO)
+library(biomaRt)
+```
+
+```{r}
+DA_metadata = read.csv("data/metadata-fitlered.csv")
+rownames(DA_metadata) = DA_metadata$sample_name
+data = fread("data/data_filtered.txt") %>%
+  tibble::column_to_rownames("sample_name")
+
+data = t(data)
+# data = data %>%
+#   tibble::column_to_rownames("sample_name")
+
+seuratObj = CreateSeuratObject(counts = data, assay = "RNA", meta.data = DA_metadata)
+Idents(seuratObj) = "layer"
+
+saveRDS(seuratObj , "/scratch/rmoussa/DS/seurat_v1.rds")
+saveRDS(seuratObj , "data/seurat_v1.rds")
+
+```
+
+```{r}
+seuratObj = readRDS("/scratch/rmoussa/DS/seurat_v1.rds")
+seuratObj_GABA = subset(seuratObj, class_label %in% "GABAergic")
+seuratObj_GLUTA = subset(seuratObj, class_label %in% "Glutamatergic")
+
+
+
+saveRDS(seuratObj_GABA , "/scratch/rmoussa/DS/seurat_GABA.rds")
+saveRDS(seuratObj_GABA , "data/seurat_GABA.rds")
+saveRDS(seuratObj_GLUTA , "/scratch/rmoussa/DS/seurat_Gluta.rds")
+saveRDS(seuratObj_GLUTA , "data/seurat_Gluta.rds")
+```
+
+prepare objects for machine learning part
+```{r}
+ion_channels = read.delim("data/genenames.txt",header = FALSE)[,1]
+seuratObj_GABA.norm = NormalizeData(seuratObj_GABA)
+seuratObj_GABA.norm_subset = seuratObj_GABA.norm@assays$RNA@data[rownames(seuratObj_GABA.norm@assays$RNA@data) %in% toupper(ion_channels),]
+
+write.table(t(as.matrix(seuratObj_GABA.norm_subset)), file = "data/data_gaba.normalized.txt", sep = "\t", row.names = TRUE)
+
+seuratObj_GLUTA.norm = NormalizeData(seuratObj_GLUTA)
+seuratObj_GLUTA.norm_subset = seuratObj_GLUTA.norm@assays$RNA@data[rownames(seuratObj_GLUTA.norm@assays$RNA@data) %in% toupper(ion_channels),]
+
+write.table(t(as.matrix(seuratObj_GLUTA.norm_subset)), file = "data/data_gluta.normalized.txt", sep = "\t", row.names = TRUE)
+```
+get marker genes
+```{r}
+out_dir = "scenic-seuratAnalysis"
+dir.create(out_dir, recursive = TRUE)
+markers <- FindAllMarkers(seuratObj, only.pos = F, assay = "RNA")
+write.table(markers, file=paste0(out_dir, "202206_g12_ECs.csv"), quote=FALSE, sep=",", row.names = T)
+
+seurat_gaba = subset(seuratObj, subset = class_label %in% "GABAergic")
+markers <- FindAllMarkers(seurat_gaba, only.pos = F, assay = "RNA")
+write.csv(markers, file=paste0(out_dir, "markerGenes-gaba.csv"), quote=FALSE, sep=",", row.names = T)
+
+seurat_gluta= subset(seuratObj, subset = class_label %in% "Glutamatergic")
+markers <- FindAllMarkers(seurat_gluta, only.pos = F, assay = "RNA")
+write.csv(markers, file=paste0(out_dir, "markerGenes-gluta.csv"), quote=FALSE, sep=",", row.names = T)
+
+```
+
+
+
+```{r}
+scenicOutDir = "../SCENICanalysis/output/"
+analysisOutDir = "scenic-seuratAnalysis/"
+markerGenesFile = "scenic-seuratAnalysis/markerGenes.csv"
+dir.create(analysisOutDir, recursive = T)
+seuratObj = readRDS("data/seurat_v1.rds")
+#seuratObj = seuratObj_GABA
+```
+
+create umaps and dimplots
+```{r}
+seuratObj = NormalizeData(object = seuratObj)
+seuratObj = FindVariableFeatures(object = seuratObj)
+seuratObj = ScaleData(object = seuratObj)
+seuratObj = RunPCA(object = seuratObj)
+seuratObj <- FindNeighbors(object = seuratObj)
+seuratObj <- FindClusters(object = seuratObj)
+seuratObj <- RunTSNE(object = seuratObj)
+#seuratObj <- RunUMAP(object = seuratObj,umap.method = "uwot-learn")
+
+pdf(paste0("dimplotGluta.pdf"))
+DimPlot(seuratObj,
+        label=T, repel =T,
+        label.size = 3, 
+        #group.by = "layer",
+        cols = qualitative_hcl(27, "Dynamic")) + 
+  theme_void() +
+  theme(legend.position = "none") +
+  ggtitle("TNSE DimPlot for Glutamatergic cells")
+dev.off()
+```
+
+
+
+
+```{r}
+scenic_df_wide <- read.csv(paste0(scenicOutDir, "/new_aucell_mtx.tsv"),
+                           sep = "\t",
+                           row.names = "Cell")
+
+colnames(scenic_df_wide) <- colnames(scenic_df_wide) %>% str_replace(pattern = fixed("..."), "")
+colnames(scenic_df_wide) <- colnames(scenic_df_wide) %>% str_replace(pattern = fixed("."), "-")
+
+all_TFs <- colnames(scenic_df_wide)
+#Create new assay called scenic
+seuratObj[["scenic"]] <- CreateAssayObject(counts = t(scenic_df_wide))
+```
+
+
+Filter out the regulons based on a threshold
+```{r}
+runs = 50
+#was 0.95 but rather few results so lowered it
+threshold = 0.90
+regulon_files = list.files(path = paste0(scenicOutDir, "/regulon/"), full.names = TRUE)
+
+regulons_all = list()
+
+for (file in regulon_files){
+  
+  if (length(grep(file, pattern = "regulons.tsv"))>0){next}
+  
+  tf_Cur = gsub(basename(file), pattern = "\\(.*tsv", replacement = "")
+  regulon_Cur = read.delim(file, sep = "\t", header = FALSE) %>%
+    dplyr::filter(V2 >= ceiling(threshold*runs))
+  
+  if(nrow(regulon_Cur) >0){
+    regulons_all[[as.character(tf_Cur)]] = regulon_Cur
+  }
+  
+}
+
+targene_df = dplyr::bind_rows(regulons_all, .id = "TF") %>%
+  dplyr::rename(target = V1, count = V2)
+
+
+```
+
+get marker genes
+```{r}
+if(!file.exists(markerGenesFile)){
+  markerGenes <- FindAllMarkers(seuratObj, only.pos = F, assay = "RNA")
+  write.table(markerGenes, file=markerGenesFile, quote=FALSE, sep=",", row.names = T)
+}else{
+  markerGenes = read.csv(file = markerGenesFile, )
+}
+
+
+# first filter the marker genes by logFC and pvalue
+# after filtering for pvalue 18k out of 22k genes have an avg logFC <1
+markerGenes_filtered = markerGenes %>%
+  dplyr::filter(p_val_adj <=0.05) %>% # this only eliminates about 2k genes
+  dplyr::filter(avg_log2FC >= 0.5)
+```
+
+
+subset significant TFs
+
+```{r, fig.width=15, fig.height=3}
+DE_genes = split( markerGenes_filtered$gene, f = markerGenes_filtered$cluster)
+
+
+out_dir = paste0(analysisOutDir,"FisherTest/")
+dir.create(out_dir)
+sig_TFs <- list()
+all_TFs <- list()
+all_TFS.fisherData <- list()
+
+for (p in unique(seuratObj@meta.data$layer)){
+  p_tmp = gsub(pattern = "\\/", replacement = " ", x = p)
+  pdf(paste0(out_dir, "FisherTF_targets_", p_tmp, ".pdf"), width = 15, height = 4) #Diagnostic pdf plots
+  #not all DE genes in SCENIC GRN, important in order to have the right numbers in the contigency table
+  tmp_genes <- intersect(DE_genes[[p]], unique(targene_df$target))
+  
+  count_tfs_genes <- as.data.frame(table(targene_df[which(targene_df$target %in% tmp_genes), "TF"]))
+  n_cluster_genes <- length(unique(targene_df[which(targene_df$target %in% tmp_genes), "target"])) #number of marker genes per cluter
+  n_targets <- length(unique(targene_df$target)) #total genes in the GRN
+  colnames(count_tfs_genes) <- c("TF", "TF_y_C_y") #y means yes, TF yess C(luster) yess
+  rownames(count_tfs_genes) <- count_tfs_genes$TF
+  
+  count_tfs_genes2 <- as.data.frame(table(targene_df[which(targene_df$TF %in% count_tfs_genes$TF), "TF"]))
+  count_tfs_genes$n_genes <- count_tfs_genes2$Freq
+  
+  rm(count_tfs_genes2)
+  count_tfs_genes <- count_tfs_genes[rev(order(count_tfs_genes$TF_y_C_y)), ]
+  count_tfs_genes$TF_y_C_n <- count_tfs_genes$n_genes - count_tfs_genes$TF_y_C_y #TF yes cluster no
+  count_tfs_genes$TF_n_C_y <- n_cluster_genes -  count_tfs_genes$TF_y_C_y #TF no cluster yes
+  count_tfs_genes$TF_n_C_n <- n_targets -  (count_tfs_genes$TF_n_C_y + count_tfs_genes$n_genes) #TF no cluster no
+  
+  q1 <- ggplot(count_tfs_genes, aes(x = factor(TF, levels = TF), y = TF_y_C_y)) + 
+      geom_bar(stat = "identity") + 
+      theme_bw() + 
+      theme(text = element_text(size = 15), 
+                   axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + 
+    xlab("TFs") + 
+    ylab("n target genes") + 
+    ggtitle(p)
+  plot(q1)
+  
+  q2 <- ggplot(count_tfs_genes, aes(x = factor(TF, levels = TF), y = log10(n_genes))) + 
+   geom_bar(stat = "identity") + 
+   theme_bw() + 
+   theme(text = element_text(size = 15), 
+                 axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + xlab("TFs") + ggtitle(p) + 
+    ylab("log10(n) target genes")
+  plot(q2)
+  
+  #Contigency table for fisher test
+  table_tfs <- data.frame()
+
+  for (i in unique(rownames(count_tfs_genes))){
+    cont_table <- data.frame()
+    cont_table['Cluster', i] <- count_tfs_genes[i, 'TF_y_C_y']
+    cont_table['Cluster', 'rest'] <- count_tfs_genes[i, 'TF_n_C_y']
+    cont_table['Rest', i] <- count_tfs_genes[i, 'TF_y_C_n'] #Rest of dataset/single cells
+    cont_table['Rest', 'rest'] <- count_tfs_genes[i, 'TF_n_C_n'] #Rest of dataset/single cells
+    table_tfs[i, 'TF'] <- i
+    table_tfs[i, 'Fisher_pvalue'] <- fisher.test(cont_table, alternative='two.sided', conf.int = TRUE)$p.value
+    table_tfs[i, 'OR'] <- fisher.test(cont_table, alternative='two.sided', conf.int = TRUE)$estimate
+  }
+
+  table_tfs$fdr <- p.adjust(table_tfs$Fisher_pvalue, method="fdr")
+  
+  table_tfs$padj <- ifelse(table_tfs$fdr < 0.05, 
+                          "<0.1", 
+                          "n.s.")
+  write.table(table_tfs, file = paste0(out_dir, "FisherTF_targets_", p_tmp, ".tsv"))
+  #Plot enrichment
+  q3 <- ggplot(table_tfs, aes(x = factor(TF, levels = count_tfs_genes$TF), y = log2(OR), fill = padj)) + 
+      geom_bar(stat = "identity") + 
+      theme_bw() + 
+      theme(text = element_text(size = 15), 
+                     axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), 
+            legend.position = "right") + xlab("TFs") + scale_fill_manual("padj", values = c("n.s." = "#BF812D", "<0.05" = "#35978F"))
+  plot(q3)
+  #Select for significantly enriched, not depleted
+  sig_TFs[[p]] <- table_tfs[which(table_tfs$padj <= 0.05 & log2(table_tfs$OR) > 0), "TF"]
+  all_TFs[[p]] <- unique(table_tfs$TF)
+  all_TFS.fisherData[[p]] = table_tfs
+  dev.off()
+  
+}
+```
+
+plot how the TFs were filtered out
+```{r TF filtering}
+
+x1 = dplyr::bind_rows(lapply(sig_TFs, function(x){return(as.data.frame(x))}), .id = "cluster") %>%
+  dplyr::mutate(postFilter = 1)
+  #tidyr::pivot_wider(names_from = cluster, values_from = preFilter, values_fill = 0)
+x2 = dplyr::bind_rows(lapply(all_TFs, function(x){return(as.data.frame(x))}), .id = "cluster") %>%
+  dplyr::mutate(preFilter = 1)
+
+
+pdf(paste0(analysisOutDir, "/TFs-postFilter.pdf"))
+
+all_TFs.h = draw(x2 %>%
+  tidyr::pivot_wider(names_from = cluster, values_from = preFilter, values_fill = 0) %>%
+  tibble::column_to_rownames("x") %>%
+  as.matrix() %>%
+  ComplexHeatmap::Heatmap(name = "present/abs", 
+                          show_row_dend = FALSE, show_column_dend = FALSE, 
+                          col = c("grey", "#3B9AB2"),
+                          column_title = "TFs-preFiltering", column_title_side = "top",
+                          row_title = "TF",
+                          row_names_gp = gpar(fontsize = 3), row_names_side = "left",
+                          column_names_gp = gpar(fontsize = 6)))
+
+#all_TFs.h
+
+for (fdr_threshold in c(0.01, 0.02, 0.05, 0.08, 0.1, 0.2)){
+  
+  dfCur = dplyr::bind_rows(all_TFS.fisherData, .id = "cluster") %>%
+    dplyr::mutate(postFilter = 1) %>%
+    dplyr::filter(fdr <= fdr_threshold) %>%
+    dplyr::select(cluster, TF, postFilter) %>%
+    dplyr::rename(x = TF)
+  
+  draw(dplyr::left_join(x2, dfCur) %>%
+  dplyr::select(-preFilter) %>%
+  tidyr::pivot_wider(names_from = cluster, values_from = postFilter, values_fill = 0) %>%
+  replace(is.na(.), 0) %>%
+  tibble::column_to_rownames("x") %>%
+  dplyr::select(column_order(all_TFs.h)) %>%
+  dplyr::slice(row_order(all_TFs.h)) %>%
+  as.matrix() %>%
+  ComplexHeatmap::Heatmap(name = "present/abs", 
+                          cluster_rows = FALSE, cluster_columns = FALSE,
+                          col = c("grey", "#3B9AB2"),
+                          column_title = paste0("TFs-postFiltering. (FDR<=", fdr_threshold, ")"), column_title_side = "top",
+                          row_title = "TF",
+                          row_names_gp = gpar(fontsize = 3), row_names_side = "left",
+                          column_names_gp = gpar(fontsize = 6)))
+    
+}
+
+dev.off()
+
+pdf(paste0(analysisOutDir,"/nTFs.filtered_padj0.05_OR0.pdf"))
+
+tmp = as.data.frame(table(x1$cluster))
+ggplot(tmp, aes(x = reorder(Var1, -Freq), y = Freq)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  xlab("cluster") + ylab("nTFsrs") + ggtitle("Number of (filtered) TFs per cluster")
+
+dev.off()
+
+rm(tmp)
+  
+```
+plot the regulon overlap
+
+
+
+```{r}
+
+pdf(paste0(analysisOutDir, "/regulonOverlap-byLayer.pdf"))
+
+for (clusterCur in sort(unique(markerGenes_filtered$cluster))){
+  
+  print(clusterCur)
+   
+  markerGenesCur = markerGenes_filtered %>%
+    dplyr::filter(cluster ==clusterCur)
+  
+  regulon_subset = merge(markerGenesCur, targene_df %>% dplyr::rename(gene = target)) %>%
+    dplyr::select(TF, gene) %>%
+    dplyr::filter(TF %in% sig_TFs[[clusterCur]]) %>%
+    dplyr::mutate(tmp = 1) %>%
+    tidyr::pivot_wider(names_from= TF, values_from = tmp, values_fill = 0) %>%
+    tibble::column_to_rownames("gene")
+  
+    if (length(unique(as.vector(as.matrix(regulon_subset)))) == 1){
+      regulon_subset$dummyVar = 0
+    }
+  
+  genes_barplot = apply(regulon_subset, 1, sum)
+  TFs_barplot = apply(regulon_subset, 2, sum)
+  
+  print(
+    Heatmap(as.matrix(regulon_subset),
+            name = "present/abs", 
+            show_row_dend = FALSE, show_column_dend = FALSE,
+            col = c("grey", "#3B9AB2"),
+            column_title = paste0(clusterCur, "\nTFs"), column_title_side = "top",
+            row_title = "genes",
+            row_names_gp = gpar(fontsize = 3), row_names_side = "left",
+            column_names_gp = gpar(fontsize = 6),
+            top_annotation = HeatmapAnnotation(regulonSize = anno_barplot(TFs_barplot, border = FALSE, bar_width = 0.8,
+                                                                          gp = gpar(fill = "#F21A00")),
+                                               annotation_name_side = "left", annotation_name_gp = grid::gpar(fontsize=7)),
+            right_annotation = rowAnnotation(nTFs = anno_barplot(genes_barplot, border = FALSE, bar_width = 0.8,
+                                                                          gp = gpar(fill = "#E1AF00")),
+                                             annotation_name_gp = grid::gpar(fontsize=7))
+            )
+  )
+  
+}
+
+dev.off()
+
+
+sig_TFs.vector = Reduce(c, sig_TFs)
+
+pdf(paste0(analysisOutDir, "/regulonOverlap-byTF.pdf"))
+
+for (TFCur in sort(unique(targene_df$TF))){
+  
+  print(TFCur)
+  if(! TFCur %in% sig_TFs.vector){next}
+  
+  targene_dfCur = targene_df %>%
+    dplyr::filter(TF == TFCur)
+   
+  # markerGenesCur = markerGenes_filtered %>%
+  #   dplyr::filter(cluster ==clusterCur)
+  
+  regulon_subset = merge(markerGenes_filtered, targene_dfCur %>% dplyr::rename(gene = target)) %>%
+    dplyr::select(gene, cluster) %>%
+    dplyr::mutate(tmp = 1) %>%
+    tidyr::pivot_wider(names_from= cluster, values_from = tmp, values_fill = 0) %>%
+    tibble::column_to_rownames("gene")
+  
+  for (col in colnames(regulon_subset)){
+    if (! TFCur %in% sig_TFs[[col]]){
+      regulon_subset[,col] <- NULL
+    }
+  }
+  
+  regulon_subset = regulon_subset %>%
+    dplyr::filter(rownames(.) %in% rownames(regulon_subset)[apply(regulon_subset, 1, 
+                                                                 function(x){return(length(which(x==0))!= length(x))}) ])
+  
+  # filter all 0 rows
+  apply(regulon_subset, 1, function(x){return(length(which(x==0))!= length(x))})  
+  
+  genes_barplot = apply(regulon_subset, 1, sum)
+  clusters_barplot = apply(regulon_subset, 2, sum)
+  
+  cols = ifelse(nrow(unique(as.matrix(regulon_subset))) == 1 ,"#3B9AB2", "grey,#3B9AB2")
+  print(
+    Heatmap(as.matrix(regulon_subset),
+            name = "present/abs", 
+            show_row_dend = FALSE, show_column_dend = FALSE,
+            #col = ifelse(nrow(unique(as.matrix(regulon_subset))) == 1 ,"#3B9AB2", c("grey", "#3B9AB2")),
+            col = unlist(str_split(cols, pattern = ",")),
+            column_title = paste0(TFCur), column_title_side = "top",
+            row_title = "genes",
+            row_names_gp = gpar(fontsize = 3), row_names_side = "left",
+            column_names_gp = gpar(fontsize = 6),
+            top_annotation = HeatmapAnnotation(regulonSize = anno_barplot(clusters_barplot, border = FALSE, bar_width = 0.8,
+                                                                          gp = gpar(fill = "#F21A00")),
+                                               annotation_name_side = "left", annotation_name_gp = grid::gpar(fontsize=7)),
+            right_annotation = rowAnnotation(nTFs = anno_barplot(genes_barplot, border = FALSE, bar_width = 0.8,
+                                                                          gp = gpar(fill = "#E1AF00")),
+                                             annotation_name_gp = grid::gpar(fontsize=7))
+            )
+  )
+  
+}
+
+dev.off()
+
+```
+
+
+
+
+```{r regulon subset enrichment}
+# fix cluster labels
+# tmp = seuratObj@meta.data %>%
+#   dplyr::select(eval(idents), seurat_clusters) %>%
+#   unique()
+# cluster_labels = as.vector(tmp$seurat_clusters)
+# names(cluster_labels) = tmp$Annotation
+
+#markerGenes$cluster_seurat = cluster_labels[match(markerGenes$cluster, names(cluster_labels))]
+
+
+
+barplot_data = as.data.frame(table(markerGenes$cluster))
+
+pdf(paste0(analysisOutDir,"/nMarkers.filtered_padj0.05_logFC0.5.pdf"))
+ggplot(barplot_data, aes(x = reorder(Var1, -Freq), y = Freq)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  xlab("cluster") + ylab("nMarkers") + ggtitle("Number of (filtered) marker genes per cluster")
+dev.off()
+
+non_zero = apply(seuratObj@assays$RNA@data, 1, function(x){return(sum(x)!=0)})
+backgorund_genes = rownames(seuratObj@assays$RNA@data)[non_zero]
+
+ensembl <- useEnsembl(biomart = "genes", dataset = "mmusculus_gene_ensembl")
+background_entrez = getBM(mart = ensembl,
+                              attributes =  "entrezgene_id",
+                              filters = "external_gene_name",
+                              values =backgorund_genes)[,1] %>%
+      na.omit() %>% as.character()
+# for every set of maker genes: find the TF that regulates them (in general). the marker genes are part of which TF's regulon?
+
+GO_BP.enrichment_regulonSubset = list()
+#GO_BP.enrichment_regulonSubset = readRDS(paste0("/g/scb/zaugg/rmoussa/AML/reclusteredAnalysis2/GO_BP.enrichment_regulonSubset.rds"))
+GO_MF.enrichment_regulonSubset = list()
+#GO_MF.enrichment_regulonSubset = readRDS(paste0("/g/scb/zaugg/rmoussa/AML/reclusteredAnalysis2/GO_MF.enrichment_regulonSubset.rds"))
+
+for (clusterCur in unique(markerGenes_filtered$cluster)){
+  
+  print(clusterCur)
+   
+  markerGenesCur = markerGenes_filtered %>%
+    dplyr::filter(cluster ==clusterCur)
+  
+  regulon_subset = merge(markerGenesCur, targene_df %>% dplyr::rename(gene = target))
+  
+  for (TFcur in unique(regulon_subset$TF)){
+     print(TFcur)
+    
+    
+     foreground_genes = regulon_subset %>%
+       dplyr::filter(TF == TFcur) %>% 
+       dplyr::pull(gene) %>% 
+       unique()
+       
+       query =  getBM(mart = ensembl,
+                              attributes =  c("entrezgene_id", "ensembl_gene_id"),
+                              filters = "external_gene_name",
+                              values =foreground_genes)
+  
+      foreground_entrez = query$entrezgene_id %>% na.omit() %>% as.character()
+      
+      geneList = factor(as.integer(unique(background_entrez) %in% unique(foreground_entrez)))
+      names(geneList) = as.character(unique(background_entrez))
+      
+      if (length(levels(geneList))!=2) {next}
+         
+      bp_enrichment = suppressMessages(new("topGOdata",
+                                             ontology = "BP",
+                                             allGenes = geneList,
+                                             description = "GO-BP annotation",
+                                             nodeSize = 5,
+                                             annot = topGO::annFUN.org,
+                                             mapping = "org.Mm.eg.db", 
+                                             ID = "entrez"))
+  
+      result = suppressMessages(topGO::runTest(bp_enrichment, algorithm = "weight01", statistic = "fisher"))
+      result.tbl = unique(topGO::GenTable(bp_enrichment, pval = result, orderBy = "pval", numChar = 1000, 
+                                              topNodes = length(topGO::score(result))) ) %>%
+        dplyr::rename(ID = GO.ID)
+      
+      
+      result.tbl$GeneRatio = result.tbl$Significant / length(unique(foreground_genes))
+      GO_BP.enrichment_regulonSubset[[as.character(clusterCur)]][[TFcur]] = result.tbl
+
+      mf_enrichment = suppressMessages(new("topGOdata",
+                                               ontology = "MF",
+                                               allGenes = geneList,
+                                               description = "GO-MF annotation",
+                                               nodeSize = 5,
+                                               annot = topGO::annFUN.org,
+                                               mapping = "org.Mm.eg.db", 
+                                               ID = "entrez"))
+  
+      result = suppressMessages(topGO::runTest(mf_enrichment, algorithm = "weight01", statistic = "fisher"))
+      result.tbl = unique(topGO::GenTable(mf_enrichment, pval = result, orderBy = "pval", numChar = 1000, 
+                                              topNodes = length(topGO::score(result))) ) %>%
+        dplyr::rename(ID = GO.ID)
+         
+      result.tbl$GeneRatio = result.tbl$Significant / length(unique(foreground_genes))
+      GO_MF.enrichment_regulonSubset[[as.character(clusterCur)]][[TFcur]] = result.tbl
+    
+    
+      
+  }
+   
+  write_rds(GO_MF.enrichment_regulonSubset, file = paste0(analysisOutDir,"/GO_MF.enrichment_regulonSubset.rds"))
+  write_rds(GO_BP.enrichment_regulonSubset, file = paste0(analysisOutDir,"/GO_BP.enrichment_regulonSubset.rds"))
+
+}
+
+# write_rds(GO_MF.enrichment_regulonSubset, file = "/g/scb/zaugg/rmoussa/AML/GO_MF.enrichment_regulonSubset.rds")
+# write_rds(GO_BP.enrichment_regulonSubset, file = "/g/scb/zaugg/rmoussa/AML/GO_BP.enrichment_regulonSubset.rds")
+
+```
+
+ENRICHMENT PLS
+
+```{r}
+# per layer per TF enrichment
+GO_BP.enrichment_regulonSubset = readRDS(paste0(analysisOutDir, "/GO_BP.enrichment_regulonSubset.rds"))
+GO_MF.enrichment_regulonSubset = readRDS(paste0(analysisOutDir, "/GO_MF.enrichment_regulonSubset.rds"))
+GO_BP.enrichment_regulonSubset = list()
+GO_MF.enrichment_regulonSubset = list()
+nSignificant = 2
+p = 0.05
+nID = 20
+
+outdir = paste0(analysisOutDir, "/TFEnrichment/GOEnrichment/")
+dir.create(outdir, recursive = TRUE)
+  
+tmp = list(GO_BP.enrichment_regulonSubset, GO_MF.enrichment_regulonSubset)
+
+for (i  in c(1:length(tmp))){
+  
+  enrichmentDataset = tmp[[i]]
+  
+  filename = ifelse(i ==1, paste0(outdir,"BPenrichment-reducedRegulon.pdf"),  paste0(outdir,"MFenrichment-reducedRegulon.pdf"))
+  enrichmentType = ifelse(i==1, "BP", "MF")
+  
+  pdf(filename)
+  
+  for (clusterCur in unique(names(enrichmentDataset))){
+  
+    #clusterlabelCur = names(cluster_labels)[cluster_labels == clusterCur]
+    clusterlabelCur = clusterCur
+    
+    dataCur = dplyr::bind_rows(enrichmentDataset[[clusterCur]], .id = "TF")
+    if(nrow(dataCur)==0){next}
+    
+    dataCur = dataCur %>% 
+          dplyr::filter(Significant >= nSignificant) %>% # filter out terms with less than a certain number of significant terms
+          dplyr::mutate(pval = as.numeric(gsub(">|<", "", pval))) %>%
+          dplyr::filter(pval <= p )
+    
+     dataCur.wide = dataCur %>% 
+          dplyr::select(TF, ID,  pval) %>%
+          tidyr::pivot_wider(names_from = TF, values_from = pval) %>%
+          dplyr::rowwise() %>%
+          dplyr::mutate(nSig = sum(dplyr::c_across(where(is.numeric)) <= p, na.rm = TRUE)) %>%
+          dplyr::ungroup() %>%
+          dplyr::filter(nSig >0)
+       #dplyr::mutate_at(dplyr::vars(!dplyr::contains("ID")), function(x){return(-log10(x))})
+     
+       markerGenesCur = markerGenes_filtered %>%
+         dplyr::filter(cluster ==clusterCur)
+  
+      regulon_subset = merge(markerGenesCur, targene_df %>% dplyr::rename(gene = target))
+     
+       markerGenesCur = markerGenes_filtered %>%
+        dplyr::filter(cluster ==clusterCur)
+      regulon_subset = merge(markerGenesCur, targene_df %>% dplyr::rename(gene = target))
+      
+     regulonSize = table(targene_df$TF)[names(dataCur.wide %>% dplyr::select(-c("ID", "nSig")))]
+     regulonSubsetSize = table(regulon_subset$TF)[names(dataCur.wide %>% dplyr::select(-c("ID", "nSig")))]
+     
+     reg_barplot = cbind(regulonSubsetSize, regulonSize-regulonSubsetSize)
+     
+     print(
+       ComplexHeatmap::Heatmap(dataCur.wide %>% dplyr::select(-c("ID", "nSig")) %>% as.matrix(),
+                             cluster_rows = FALSE, cluster_columns = FALSE,
+                             name = "pvalue",
+                             col = rev(wesanderson::wes_palette(name = "Zissou1", n = 10, type = "continuous")),
+                             #column_title = paste0(clusterlabelCur, ": BP Enrichment"))
+                             column_title = paste0(clusterlabelCur, ": ", enrichmentType , "Enrichment"))
+     )
+     
+       ID_subset =  dataCur %>% 
+              dplyr::group_by(TF) %>% 
+              dplyr::arrange(pval) %>% 
+              dplyr::slice(seq_len(nID)) %>%
+              dplyr::pull(ID) %>% as.character()
+      
+       dataCur.wide.reduced = dataCur.wide %>%
+                dplyr::filter(ID %in% ID_subset) %>%
+                dplyr::mutate(Term = dataCur$Term[match(ID, dataCur$ID)]) %>%
+                dplyr::filter(!is.na(Term)) %>%
+                dplyr::select(-nSig, -ID) %>%
+                tibble::column_to_rownames("Term") 
+                #dplyr::mutate_at(dplyr::vars(!dplyr::contains("ID")), function(x){return(-log10(x))})
+       
+       TF_clusters = DA_all$cluster[match(colnames(dataCur.wide.reduced), DA_all$gene)]
+       TF_cluster_label = names(cluster_labels)[match(TF_clusters, cluster_labels)]
+       
+    #  print(
+        h = ComplexHeatmap::Heatmap(dataCur.wide.reduced %>% as.matrix(),
+                         cluster_rows = FALSE, cluster_columns = FALSE,
+                         name = "pvalue",
+                         col = rev(wesanderson::wes_palette(name = "Zissou1", n = 10, type = "continuous")),
+                         #column_title = ifelse(i==1, paste0(clusterlabelCur, ": BP Enrichment (reduced)"), paste0(clusterlabelCur, ": MF Enrichment (reduced)")), 
+                         column_title = paste0(clusterlabelCur, ": ", enrichmentType ," Enrichment (reduced)"),
+                         row_names_gp = gpar(fontsize = 3), row_names_side = "left",
+                         column_names_gp = gpar(fontsize = 6),
+                         top_annotation = ComplexHeatmap::HeatmapAnnotation(
+                                          # avg_log2FC = ComplexHeatmap::anno_barplot(
+                                          #     x = DA_all$avg_log2FC[match(colnames(dataCur.wide.reduced), DA_all$gene)],
+                                          #     border = FALSE,  bar_width = 0.8,  gp = grid::gpar(fill = "#046C9A")),
+                                          regulonSize = anno_barplot(reg_barplot, border = FALSE, bar_width = 0.8, 
+                                                                    #gp = gpar(fill = c(wes_palette(name = "Darjeeling1")[2], "#EB5000")),
+                                                                    gp = gpar(fill = c("#BDC367" , wes_palette(name = "Darjeeling2")[2] )),
+                                                                     width = unit(5, "cm")),
+                                          annotation_name_gp = grid::gpar(fontsize=7), annotation_name_side = "left", annotation_name_rot = 0
+                                         # cluster = TF_cluster_label
+                         )
+                          ) 
+      #)
+      
+      legends <- list(Legend(labels = c("RegulonSize", "nMakrer"), legend_gp = gpar(fill = c(wes_palette(name = "Darjeeling2")[2],"#BDC367" ) ) ) )
+      draw(h, annotation_legend_list = legends, annotation_legend_side = "right")
+      
+      # draw the same plot but for the significant TFs
+      
+      sigTF_subset = sig_TFs[[clusterlabelCur]]
+      
+      dataCur.wide.reduced = dataCur.wide.reduced %>%
+        dplyr::select(intersect(sigTF_subset, unique(dataCur$TF)))
+      
+      TF_clusters = DA_all$cluster[match(colnames(dataCur.wide.reduced), DA_all$gene)]
+      TF_cluster_label = names(cluster_labels)[match(TF_clusters, cluster_labels)]
+      
+        print(
+          ComplexHeatmap::Heatmap(dataCur.wide.reduced %>% as.matrix(),
+                         cluster_rows = FALSE, cluster_columns = FALSE,
+                         name = "pvalue",
+                         col = rev(wesanderson::wes_palette(name = "Zissou1", n = 10, type = "continuous")),
+                         #column_title = ifelse(i==1, paste0(clusterlabelCur, ": BP Enrichment (reduced, sigTF)"), paste0(clusterlabelCur, ": MF Enrichment (reduced, sigTF)")), 
+                         column_title = paste0(clusterlabelCur, ": ", enrichmentType ," Enrichment (reduced, TFsig)"),
+                         row_names_gp = gpar(fontsize = 3), row_names_side = "left",
+                         column_names_gp = gpar(fontsize = 6),
+                         # top_annotation = ComplexHeatmap::HeatmapAnnotation(
+                         #                  # avg_log2FC = ComplexHeatmap::anno_barplot(
+                         #                  #     x = DA_all$avg_log2FC[match(colnames(dataCur.wide.reduced), DA_all$gene)],
+                         #                  #     border = FALSE,  bar_width = 0.8,  gp = grid::gpar(fill = "#046C9A")),
+                         #                  regulonSize = anno_barplot(reg_barplot[colnames(dataCur.wide.reduced),], border = FALSE, bar_width = 0.8,
+                         #                                            #gp = gpar(fill = c(wes_palette(name = "Darjeeling1")[2], "#EB5000")),
+                         #                                            gp = gpar(fill = c("#BDC367" , wes_palette(name = "Darjeeling2")[2] )),
+                         #                                             width = unit(5, "cm")),
+                         #                  annotation_name_gp = grid::gpar(fontsize=7), annotation_name_side = "left", annotation_name_rot = 0,
+                         #                  cluster = TF_cluster_label
+                         #                  )
+                          ) 
+        )
+    
+        
+  }
+  
+  
+  dev.off()
+  
+  
+}
+```
+
+
+
+
+

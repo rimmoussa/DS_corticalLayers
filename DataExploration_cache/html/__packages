@@ -1,0 +1,13 @@
+base
+stringr
+ggplot2
+patchwork
+dplyr
+ggrepel
+treemapify
+tidyverse
+tibble
+tidyr
+readr
+purrr
+forcats
